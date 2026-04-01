@@ -1,0 +1,25 @@
+{
+  "name": "fulcrum",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-Trust AI Security Agent with Auth0 Token Vault",
+  "scripts": {
+    "dev": "turbo run dev",
+    "dev:api": "turbo run dev --filter=@fulcrum/api",
+    "dev:web": "turbo run dev --filter=@fulcrum/web",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "db:migrate": "turbo run db:migrate --filter=@fulcrum/api",
+    "db:seed": "turbo run db:seed --filter=@fulcrum/api",
+    "clean": "turbo run clean && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5.4.0"
+  },
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
