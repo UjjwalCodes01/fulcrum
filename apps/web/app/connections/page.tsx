@@ -3,20 +3,24 @@
 import { Shield, Github, MessageSquare, FileText, Plus, Check, X, Loader2, ExternalLink } from 'lucide-react';
 import Link from 'next/link';
 import { useUser } from '@auth0/nextjs-auth0/client';
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 
 export default function ConnectionsPage() {
   const { user, isLoading } = useUser();
+  const router = useRouter();
   const [connectingService, setConnectingService] = useState<string | null>(null);
 
   // Check if user is connected via GitHub
   const isGitHubConnected = user?.sub?.startsWith('github|');
 
-  const handleConnectGitHub = () => {
+  const handleConnectGitHub = useCallback(() => {
+    setConnectingService('github');
     // Redirect to Auth0 login with connection hint to force GitHub
     // This will link the GitHub account to the user's profile
-    window.location.href = `/api/auth/login?connection=github&returnTo=${encodeURIComponent('/connections')}`;
-  };
+    const url = `/api/auth/login?connection=github&returnTo=${encodeURIComponent('/connections')}`;
+    router.push(url);
+  }, [router]);
 
   if (isLoading) {
     return (

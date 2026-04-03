@@ -5,7 +5,7 @@ import { Shield, AlertCircle, CheckCircle, LogOut, User } from 'lucide-react';
 import Link from 'next/link';
 
 export default function DashboardPage() {
-  const { user, isLoading, error } = useUser();
+  const { user, isLoading } = useUser();
 
   if (isLoading) {
     return (

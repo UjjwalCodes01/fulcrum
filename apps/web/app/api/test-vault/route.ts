@@ -1,15 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSession, getAccessToken } from '@auth0/nextjs-auth0';
 
+// Define types at top level
+interface VaultResult {
+  accessToken?: string;
+  error?: string;
+  exchangeMethod?: string;
+  expiresIn?: number;
+}
+
+interface GithubRepo {
+  name: string;
+  private: boolean;
+  html_url: string;
+}
+
 /**
  * Test Token Vault Exchange
  * 
- * This endpoint tests Token Vault directly:
+ * This endpoint tests Token Vault using ACCESS TOKEN exchange:
  * 1. Get user's Auth0 access token  
- * 2. Exchange via Token Vault for GitHub token
+ * 2. Exchange via Token Vault for GitHub token (using access token flow)
  * 3. Use GitHub token to fetch repos
+ * 
+ * NOTE: We use ACCESS TOKEN exchange which doesn't require refresh tokens.
+ * This bypasses the GitHub App refresh token issue.
  */
-export async function GET(request: NextRequest) {
+export async function GET(_request: NextRequest) {
   try {
     // Step 1: Get the user's session
     const session = await getSession();
@@ -27,7 +44,7 @@ export async function GET(request: NextRequest) {
       }, { status: 400 });
     }
 
-    // Step 2: Get the access token
+    // Step 2: Get the access token (we'll use this for Token Vault exchange)
     let tokenResponse;
     try {
       tokenResponse = await getAccessToken();
@@ -36,16 +53,19 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({
         error: 'Failed to get access token',
         details: error,
+        hint: 'Try logging out and back in',
       }, { status: 401 });
     }
     
     if (!tokenResponse?.accessToken) {
       return NextResponse.json({ 
         error: 'No access token available',
+        hint: 'Try logging out and back in',
       }, { status: 401 });
     }
 
-    // Call our backend to do the Token Vault exchange
+    // Step 3: Call backend Token Vault exchange
+    // The backend now supports ACCESS TOKEN exchange (no refresh token needed!)
     const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
     
     const vaultResponse = await fetch(`${backendUrl}/api/connections/github/token`, {
@@ -54,45 +74,67 @@ export async function GET(request: NextRequest) {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${tokenResponse.accessToken}`,
       },
+      // Empty body - backend will use the access token from Authorization header
+      body: JSON.stringify({}),
     });
 
-    const vaultResult = await vaultResponse.json();
+    const vaultResult = await vaultResponse.json() as VaultResult;
 
     if (!vaultResponse.ok) {
       return NextResponse.json({
         success: false,
         phase: 'Backend Token Exchange',
         error: vaultResult.error || 'Token exchange failed',
+        exchangeMethod: vaultResult.exchangeMethod || 'access_token',
         user: {
           sub: session.user.sub,
           email: session.user.email,
         },
+        debug: {
+          backendUrl,
+          hasAccessToken: !!tokenResponse.accessToken,
+        },
       }, { status: 400 });
     }
 
-    // If we got a GitHub token, test it by fetching repos
+    // Step 4: Test the GitHub token by fetching repos
     if (vaultResult.accessToken) {
       const githubResponse = await fetch('https://api.github.com/user/repos?per_page=5', {
         headers: {
           Authorization: `Bearer ${vaultResult.accessToken}`,
           Accept: 'application/vnd.github.v3+json',
+          'User-Agent': 'Fulcrum-Security-Agent',
         },
       });
 
-      const repos = await githubResponse.json();
+      if (!githubResponse.ok) {
+        const errorText = await githubResponse.text();
+        return NextResponse.json({
+          success: false,
+          phase: 'GitHub API Call',
+          error: `GitHub API returned ${githubResponse.status}`,
+          details: errorText,
+          exchangeMethod: vaultResult.exchangeMethod,
+        }, { status: 400 });
+      }
+
+      const repos = await githubResponse.json() as GithubRepo[];
 
       return NextResponse.json({
         success: true,
         phase: '🎉 TOKEN VAULT WORKING!',
+        exchangeMethod: vaultResult.exchangeMethod,
         user: {
           sub: session.user.sub,
           email: session.user.email,
           name: session.user.name,
         },
-        repos: repos.map?.((r: any) => ({
+        tokenExpiresIn: vaultResult.expiresIn,
+        repos: repos.map((r) => ({
           name: r.name,
           private: r.private,
-        })) || repos,
+          url: r.html_url,
+        })),
       });
     }
 

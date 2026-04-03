@@ -1,9 +1,9 @@
-import { Router } from 'express';
+import { Router, IRouter } from 'express';
 
-export const auditRouter = Router();
+export const auditRouter: IRouter = Router();
 
 // Placeholder - will be implemented in Phase 4
-auditRouter.get('/', (req, res) => {
+auditRouter.get('/', (_req, res) => {
   res.json({
     logs: [],
     total: 0,

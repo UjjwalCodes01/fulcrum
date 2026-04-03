@@ -1,0 +1,100 @@
+# Fulcrum FGA Authorization Model
+# 
+# This model defines the Zero-Trust authorization relationships for Project Fulcrum.
+# Upload this to Auth0 FGA at: https://dashboard.fga.dev/
+#
+# Key Concepts:
+# - Users authenticate via Auth0
+# - Agent acts on behalf of users (borrowing identity)
+# - Actions require explicit permission tuples
+# - Level 5 actions require additional CIBA approval
+
+model
+  schema 1.1
+
+# ===========================================
+# Type: user
+# Represents an authenticated user (from Auth0)
+# ===========================================
+type user
+
+# ===========================================
+# Type: agent
+# Represents the Fulcrum AI agent
+# The agent borrows identity from users via Token Vault
+# ===========================================
+type agent
+  relations
+    # Which users has this agent been authorized to act for
+    define can_act_on_behalf_of: [user]
+
+# ===========================================
+# Type: action
+# Represents a tool/operation the agent can execute
+# Examples: github_list_repos, jira_create_issue, slack_send_message
+# ===========================================
+type action
+  relations
+    # Who can execute this action
+    define can_execute: [user]
+    # Who requires approval (CIBA) to execute this action
+    define requires_approval: [user]
+
+# ===========================================
+# Type: connection
+# Represents a connected service (GitHub, Slack, Jira)
+# ===========================================
+type connection
+  relations
+    # User who owns this connection
+    define owner: [user]
+    # Connection is active and can be used
+    define is_active: [user]
+
+# ===========================================
+# Type: resource
+# Represents a specific resource (repo, project, channel)
+# Format: resource:<type>:<identifier>
+# Examples: resource:repo:owner/name, resource:project:KEY
+# ===========================================
+type resource
+  relations
+    # Who owns this resource
+    define owner: [user]
+    # Who can read this resource
+    define viewer: [user] or owner
+    # Who can edit this resource
+    define editor: [user] or owner
+    # Who can admin this resource (delete, etc)
+    define admin: [user] or owner
+
+# ===========================================
+# Type: session
+# Represents an active agent session
+# ===========================================
+type session
+  relations
+    # User who owns this session
+    define owner: [user]
+    # Is this session active
+    define is_active: [user]
+
+# ===========================================
+# Example Tuples (to be created when users connect):
+# ===========================================
+#
+# When user connects GitHub:
+#   user:github|123456 -> can_execute -> action:github_list_repos
+#   user:github|123456 -> can_execute -> action:github_scan_secrets
+#   user:github|123456 -> can_execute -> action:github_create_issue
+#   user:github|123456 -> can_execute -> action:github_create_pr
+#   user:github|123456 -> can_execute -> action:github_merge_pr
+#   user:github|123456 -> requires_approval -> action:github_merge_pr
+#   user:github|123456 -> requires_approval -> action:github_delete_branch
+#
+# When user starts a session:
+#   user:github|123456 -> owner -> session:<uuid>
+#   user:github|123456 -> is_active -> session:<uuid>
+#
+# Agent acting on behalf of user:
+#   user:github|123456 -> can_act_on_behalf_of -> agent:fulcrum

@@ -1,0 +1,290 @@
+/**
+ * CIBA Database Operations
+ * 
+ * Manages CIBA (Client Initiated Backchannel Authentication) requests.
+ * These are approval requests for Level 5 (destructive) actions.
+ * 
+ * ⚠️ HACKATHON LIMITATION: In-Memory Storage
+ * 
+ * This implementation uses in-memory Maps for storage, which means:
+ * - Data is LOST on server restart/redeploy
+ * - Does NOT work with multiple server instances
+ * - NOT suitable for production
+ * 
+ * For production, replace with PostgreSQL implementation:
+ * 1. Create ciba_requests table (see claude.md for schema)
+ * 2. Replace Map operations with SQL queries
+ * 3. Use proper connection pooling
+ * 
+ * The API contract remains the same - only storage backend changes.
+ */
+
+import { logger } from '../utils/logger.js';
+
+// Log warning on module load if in production mode
+if (process.env.NODE_ENV === 'production' || process.env.CIBA_STRICT_MODE === 'true') {
+  logger.warn('⚠️ CIBA using in-memory storage - NOT production ready! Data will be lost on restart.');
+}
+
+// CIBA Request Status
+export type CIBAStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'cancelled';
+
+// CIBA Request record
+export interface CIBARequest {
+  id: string;
+  userId: string;
+  tool: string;
+  status: CIBAStatus;
+  authReqId: string;
+  sessionId: string;
+  bindingMessage: string;
+  toolInput?: Record<string, unknown>;
+  expiresAt: Date;
+  approvedAt?: Date;
+  deniedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// In-memory store for development (replace with PostgreSQL in production)
+// This allows the hackathon demo to work without database setup
+const cibaRequestStore = new Map<string, CIBARequest>();
+
+// Index by authReqId for quick lookup
+const authReqIdIndex = new Map<string, string>();
+
+// Index by userId + status for finding pending requests
+const userPendingIndex = new Map<string, Set<string>>();
+
+/**
+ * Create a new CIBA request
+ */
+export async function createCIBARequest(params: {
+  id: string;
+  userId: string;
+  tool: string;
+  authReqId: string;
+  sessionId: string;
+  bindingMessage: string;
+  toolInput?: Record<string, unknown>;
+  expiresAt: Date;
+}): Promise<CIBARequest> {
+  const now = new Date();
+  
+  const request: CIBARequest = {
+    id: params.id,
+    userId: params.userId,
+    tool: params.tool,
+    status: 'pending',
+    authReqId: params.authReqId,
+    sessionId: params.sessionId,
+    bindingMessage: params.bindingMessage,
+    toolInput: params.toolInput,
+    expiresAt: params.expiresAt,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  // Store in memory
+  cibaRequestStore.set(request.id, request);
+  authReqIdIndex.set(request.authReqId, request.id);
+  
+  // Add to user's pending index
+  const userKey = `${params.userId}:pending`;
+  if (!userPendingIndex.has(userKey)) {
+    userPendingIndex.set(userKey, new Set());
+  }
+  userPendingIndex.get(userKey)!.add(request.id);
+
+  logger.info('CIBA request created', {
+    id: request.id,
+    userId: request.userId,
+    tool: request.tool,
+    authReqId: request.authReqId,
+    expiresAt: request.expiresAt.toISOString(),
+  });
+
+  return request;
+}
+
+/**
+ * Get a CIBA request by ID
+ */
+export async function getCIBARequest(id: string): Promise<CIBARequest | null> {
+  return cibaRequestStore.get(id) || null;
+}
+
+/**
+ * Get a CIBA request by Auth0's auth_req_id
+ */
+export async function getCIBARequestByAuthReqId(authReqId: string): Promise<CIBARequest | null> {
+  const id = authReqIdIndex.get(authReqId);
+  if (!id) return null;
+  return cibaRequestStore.get(id) || null;
+}
+
+/**
+ * Get all pending CIBA requests for a user
+ */
+export async function getPendingCIBARequests(userId: string): Promise<CIBARequest[]> {
+  const userKey = `${userId}:pending`;
+  const requestIds = userPendingIndex.get(userKey);
+  
+  if (!requestIds || requestIds.size === 0) {
+    return [];
+  }
+
+  const requests: CIBARequest[] = [];
+  for (const id of requestIds) {
+    const request = cibaRequestStore.get(id);
+    if (request && request.status === 'pending') {
+      // Check if expired
+      if (new Date() > request.expiresAt) {
+        await updateCIBARequestStatus(id, 'expired');
+      } else {
+        requests.push(request);
+      }
+    }
+  }
+
+  return requests;
+}
+
+/**
+ * Update CIBA request status
+ */
+export async function updateCIBARequestStatus(
+  id: string,
+  status: CIBAStatus,
+  additionalFields?: {
+    approvedAt?: Date;
+    deniedAt?: Date;
+  }
+): Promise<CIBARequest | null> {
+  const request = cibaRequestStore.get(id);
+  if (!request) return null;
+
+  const previousStatus = request.status;
+  request.status = status;
+  request.updatedAt = new Date();
+  
+  if (additionalFields?.approvedAt) {
+    request.approvedAt = additionalFields.approvedAt;
+  }
+  if (additionalFields?.deniedAt) {
+    request.deniedAt = additionalFields.deniedAt;
+  }
+
+  // Update indexes if no longer pending
+  if (previousStatus === 'pending' && status !== 'pending') {
+    const userKey = `${request.userId}:pending`;
+    userPendingIndex.get(userKey)?.delete(id);
+  }
+
+  cibaRequestStore.set(id, request);
+
+  logger.info('CIBA request status updated', {
+    id,
+    previousStatus,
+    newStatus: status,
+    tool: request.tool,
+    userId: request.userId,
+  });
+
+  return request;
+}
+
+/**
+ * Mark a CIBA request as approved
+ */
+export async function approveCIBARequest(id: string): Promise<CIBARequest | null> {
+  return updateCIBARequestStatus(id, 'approved', { approvedAt: new Date() });
+}
+
+/**
+ * Mark a CIBA request as denied
+ */
+export async function denyCIBARequest(id: string): Promise<CIBARequest | null> {
+  return updateCIBARequestStatus(id, 'denied', { deniedAt: new Date() });
+}
+
+/**
+ * Mark a CIBA request as expired
+ */
+export async function expireCIBARequest(id: string): Promise<CIBARequest | null> {
+  return updateCIBARequestStatus(id, 'expired');
+}
+
+/**
+ * Mark a CIBA request as cancelled
+ */
+export async function cancelCIBARequest(id: string): Promise<CIBARequest | null> {
+  return updateCIBARequestStatus(id, 'cancelled');
+}
+
+/**
+ * Check and expire old CIBA requests
+ * Should be called periodically (e.g., every minute)
+ * Returns array of expired requests for notification purposes
+ */
+export async function expireOldRequests(): Promise<CIBARequest[]> {
+  const now = new Date();
+  const expiredRequests: CIBARequest[] = [];
+
+  for (const [id, request] of cibaRequestStore) {
+    if (request.status === 'pending' && now > request.expiresAt) {
+      const expired = await expireCIBARequest(id);
+      if (expired) {
+        expiredRequests.push(expired);
+      }
+    }
+  }
+
+  if (expiredRequests.length > 0) {
+    logger.info('Expired CIBA requests', { count: expiredRequests.length });
+  }
+
+  return expiredRequests;
+}
+
+/**
+ * Get CIBA request statistics
+ */
+export function getCIBAStats(): {
+  total: number;
+  pending: number;
+  approved: number;
+  denied: number;
+  expired: number;
+  cancelled: number;
+} {
+  const stats = {
+    total: cibaRequestStore.size,
+    pending: 0,
+    approved: 0,
+    denied: 0,
+    expired: 0,
+    cancelled: 0,
+  };
+
+  for (const request of cibaRequestStore.values()) {
+    stats[request.status]++;
+  }
+
+  return stats;
+}
+
+/**
+ * Clear all CIBA requests (for testing)
+ */
+export function clearAllCIBARequests(): void {
+  cibaRequestStore.clear();
+  authReqIdIndex.clear();
+  userPendingIndex.clear();
+  logger.warn('All CIBA requests cleared');
+}
+
+// Export internal stores for pubsub handler (polling all pending requests)
+// These should only be used by the ciba-handler module
+export const cibaRequests = cibaRequestStore;
+export const cibaRequestsByAuthReqId = authReqIdIndex;

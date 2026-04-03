@@ -1,8 +1,8 @@
-import { Router } from 'express';
+import { Router, IRouter } from 'express';
 
-export const healthRouter = Router();
+export const healthRouter: IRouter = Router();
 
-healthRouter.get('/', (req, res) => {
+healthRouter.get('/', (_req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
@@ -12,7 +12,7 @@ healthRouter.get('/', (req, res) => {
   });
 });
 
-healthRouter.get('/ready', async (req, res) => {
+healthRouter.get('/ready', async (_req, res) => {
   // Add database and service checks here
   const checks = {
     api: true,
