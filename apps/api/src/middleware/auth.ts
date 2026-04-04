@@ -46,3 +46,39 @@ export function optionalAuth(req: Request, res: Response, next: NextFunction) {
     next();
   });
 }
+
+/**
+ * Admin role check middleware
+ * Requires authentication + admin role in JWT
+ */
+export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  jwtCheck(req, res, (err) => {
+    if (err) {
+      return next(err);
+    }
+    
+    const user = getUserFromToken(req);
+    if (!user) {
+      return res.status(401).json({
+        error: 'Authentication required',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+    
+    // Check for admin role in JWT
+    // Auth0 can include roles in custom claims or app_metadata
+    const roles = req.auth?.payload?.['https://fulcrum.app/roles'] as string[] | undefined;
+    const appMetadata = req.auth?.payload?.['app_metadata'] as { roles?: string[] } | undefined;
+    const isAdmin = roles?.includes('admin') || 
+                   appMetadata?.roles?.includes('admin');
+    
+    if (!isAdmin) {
+      return res.status(403).json({
+        error: 'Admin role required',
+        code: 'ADMIN_REQUIRED',
+      });
+    }
+    
+    next();
+  });
+}

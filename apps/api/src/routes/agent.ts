@@ -1,4 +1,5 @@
 import { Router, IRouter } from 'express';
+import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 import { createError } from '../utils/error-handler.js';
 import { jwtCheck, getUserFromToken } from '../middleware/auth.js';
@@ -15,8 +16,21 @@ import {
   getCIBAStatus,
   CIBARequest,
 } from '../services/ciba.js';
+import { getUserConnections } from '../services/token-vault.js';
+import { getSessionState, saveSessionState } from '../db/sessions.js';
+import {
+  invokeAgent,
+  getUsageStats,
+  isGeminiConfigured,
+  executeTool,
+  type ToolName,
+} from '../agent/index.js';
 
 export const agentRouter: IRouter = Router();
+
+// ============================================================================
+// MIDDLEWARE
+// ============================================================================
 
 // All agent routes require authentication
 agentRouter.use(jwtCheck);
@@ -66,7 +80,7 @@ agentRouter.post(
   checkFGAPermission('agent_interact'),
   async (req, res, next) => {
     try {
-      const { message, sessionId } = req.body;
+      const { message, sessionId: providedSessionId, threadId: providedThreadId } = req.body;
       const user = getUserFromToken(req);
       const fgaResult = (req as FGARequest).fgaResult;
       
@@ -77,32 +91,118 @@ agentRouter.post(
       // Validate input before processing
       validateInput(message);
       
+      // Generate session/thread IDs if not provided
+      const sessionId = providedSessionId || uuidv4();
+      const threadId = providedThreadId || `thread_${user.userId}_${Date.now()}`;
+      
       logger.info('Agent message received', { 
         userId: user.userId,
         sessionId, 
+        threadId,
         messageLength: message?.length,
         fgaAllowed: fgaResult?.allowed,
         fgaMode: fgaResult?.mode,
       });
       
-      res.json({
-        success: true,
-        message: 'Agent endpoint ready',
-        status: 'awaiting_langgraph',
-        phase: 'Phase 4: LangGraph + Gemini Agent',
+      // Check if Gemini is configured
+      if (!isGeminiConfigured()) {
+        return res.json({
+          success: false,
+          error: 'Gemini AI not configured',
+          status: 'unconfigured',
+          message: 'The AI agent is not fully configured. Please set GCP_PROJECT_ID and Vertex AI credentials.',
+          sessionId,
+          threadId,
+        });
+      }
+      
+      // Get user's access token for Token Vault
+      const userAccessToken = req.headers.authorization?.replace('Bearer ', '') || '';
+      
+      // Fetch user's connected services
+      const connectionsResult = await getUserConnections(userAccessToken);
+      const userConnections = connectionsResult.success && connectionsResult.connections 
+        ? connectionsResult.connections  // Already an array of strings like ['github', 'slack']
+        : [];
+      
+      logger.info('User connections fetched', {
+        userId: user.userId,
+        connections: userConnections,
+      });
+      
+      // Load existing session state if available
+      const existingState = await getSessionState(sessionId);
+      
+      // Invoke the agent graph with session continuity
+      const agentState = await invokeAgent({
+        sessionId,
+        userId: user.userId,
+        message,
+        userAccessToken,
+        userConnections,
+        existingState: existingState || undefined,
+      });
+      
+      // Save session state for continuity
+      await saveSessionState(sessionId, agentState);
+      
+      // Build response based on agent state
+      const response: Record<string, unknown> = {
+        success: agentState.currentState !== 'ERROR',
+        sessionId,
+        threadId,
+        state: agentState.currentState,
         fga: {
           checked: true,
           allowed: fgaResult?.allowed,
           mode: fgaResult?.mode,
         },
-        user: {
-          userId: user.userId,
-        },
-        received: {
-          sessionId,
-          messageLength: message?.length,
-        },
-      });
+      };
+      
+      // Add state-specific fields
+      if (agentState.finalResponse) {
+        response.response = agentState.finalResponse;
+      }
+      
+      if (agentState.error) {
+        response.error = {
+          code: agentState.error.code,
+          message: agentState.error.message,
+          recoverable: agentState.error.recoverable,
+        };
+      }
+      
+      if (agentState.pendingApproval) {
+        response.pendingApproval = {
+          requestId: agentState.pendingApproval.requestId,
+          tool: agentState.pendingApproval.tool,
+          bindingMessage: agentState.pendingApproval.bindingMessage,
+          expiresAt: agentState.pendingApproval.expiresAt,
+        };
+      }
+      
+      if (agentState.lastToolResult) {
+        response.lastToolResult = {
+          toolName: agentState.lastToolResult.toolName,
+          success: agentState.lastToolResult.success,
+          executionTimeMs: agentState.lastToolResult.executionTimeMs,
+        };
+      }
+      
+      // Add execution history summary
+      if (agentState.executionHistory.length > 0) {
+        response.executionHistory = agentState.executionHistory.map(h => ({
+          tool: h.tool,
+          success: h.result?.success,
+          fgaAllowed: h.fgaCheck?.allowed,
+        }));
+      }
+      
+      // Set appropriate status code
+      const statusCode = agentState.currentState === 'AWAITING_APPROVAL' ? 202 : 
+                         agentState.currentState === 'ERROR' ? 500 : 200;
+      
+      res.status(statusCode).json(response);
     } catch (error) {
       next(error);
     }
@@ -110,14 +210,35 @@ agentRouter.post(
 );
 
 // Get agent state for current session
-agentRouter.get('/state', (req, res) => {
+agentRouter.get('/state', async (req, res) => {
   const user = getUserFromToken(req);
+  const { sessionId, threadId } = req.query;
+  
+  // Get pending CIBA requests for user
+  const pendingRequests = user ? await getUserPendingRequests(user.userId) : [];
+  
+  // Get usage stats
+  const usage = getUsageStats();
   
   res.json({
     state: 'IDLE',
     userId: user?.userId,
-    phase: 'Phase 4: CIBA Integration',
-    ciba: getCIBAStatus(),
+    sessionId: sessionId || null,
+    threadId: threadId || null,
+    gemini: {
+      configured: isGeminiConfigured(),
+      usage,
+    },
+    ciba: {
+      ...getCIBAStatus(),
+      pendingRequests: pendingRequests.length,
+    },
+    pendingApprovals: pendingRequests.map(r => ({
+      id: r.id,
+      tool: r.tool,
+      status: r.status,
+      expiresAt: r.expiresAt,
+    })),
   });
 });
 
@@ -305,17 +426,48 @@ agentRouter.post(
         tool: request.tool,
       });
 
+      // Now execute the tool since it's approved
+      const userAccessToken = req.headers.authorization?.replace('Bearer ', '') || '';
+      const toolCallId = `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      
+      logger.info('Executing approved tool', {
+        userId: user.userId,
+        tool: request.tool,
+        requestId,
+      });
+      
+      const toolResult = await executeTool(
+        request.tool as ToolName,
+        toolCallId,
+        request.toolInput || {},
+        {
+          userId: user.userId,
+          userAccessToken,
+          sessionId: request.sessionId,
+          fgaCheckPassed: true, // FGA was checked when CIBA was initiated
+          cibaApproved: true, // This is the approval path
+        }
+      );
+      
+      logger.info('Approved tool execution complete', {
+        userId: user.userId,
+        tool: request.tool,
+        success: toolResult.success,
+        executionTimeMs: toolResult.executionTimeMs,
+      });
+
       res.json({
-        success: true,
-        message: 'Action approved',
+        success: toolResult.success,
+        message: 'Action approved and executed',
         request: {
           id: approvedRequest?.id,
           tool: approvedRequest?.tool,
           status: 'approved',
           approvedAt: approvedRequest?.approvedAt,
         },
-        // Include tool input so caller can resume execution
-        toolInput: request.toolInput,
+        result: toolResult.result,
+        error: toolResult.error,
+        executionTimeMs: toolResult.executionTimeMs,
       });
     } catch (error) {
       next(error);
@@ -589,28 +741,60 @@ agentRouter.post(
         });
       }
       
-      // For non-Level-5 actions, tool is authorized and ready to execute
-      logger.info('Tool execution authorized', { 
+      // For non-Level-5 actions, execute the tool directly
+      logger.info('Executing tool', { 
         userId: user.userId, 
         tool,
         riskLevel,
         fgaMode: fgaResult.mode,
       });
       
-      // Actual tool execution would happen here (LangGraph integration)
-      // For now, return success indicating authorization passed
-      res.json({
-        success: true,
+      // Get user's access token for Token Vault
+      const userAccessToken = req.headers.authorization?.replace('Bearer ', '') || '';
+      
+      // Generate a unique tool call ID
+      const toolCallId = `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      
+      // Session ID from request or generate one
+      const requestSessionId = req.body.sessionId || `session_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      
+      // Execute the tool
+      const toolResult = await executeTool(
+        tool as ToolName,
+        toolCallId,
+        toolInput,
+        {
+          userId: user.userId,
+          userAccessToken,
+          sessionId: requestSessionId,
+          fgaCheckPassed: fgaResult.allowed,
+          cibaApproved: false, // Non-CIBA path
+        }
+      );
+      
+      logger.info('Tool execution complete', { 
+        userId: user.userId, 
+        tool,
+        success: toolResult.success,
+        executionTimeMs: toolResult.executionTimeMs,
+      });
+      
+      // Return result
+      const statusCode = toolResult.success ? 200 : 500;
+      
+      res.status(statusCode).json({
+        success: toolResult.success,
         tool,
         riskLevel,
-        status: 'authorized',
+        status: toolResult.success ? 'completed' : 'failed',
         fga: {
           checked: true,
           allowed: true,
           mode: fgaResult.mode,
         },
-        message: 'Tool execution authorized - execute via LangGraph agent',
-        input: toolInput,
+        result: toolResult.result,
+        error: toolResult.error,
+        executionTimeMs: toolResult.executionTimeMs,
       });
     } catch (error) {
       next(error);

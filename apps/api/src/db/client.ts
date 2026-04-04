@@ -113,7 +113,67 @@ export async function initializeDatabase(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_ciba_expires ON ciba_requests(expires_at) WHERE status = 'pending';
     `);
     
-    logger.info('Database schema initialized');
+    // Create agent sessions table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS agent_sessions (
+        id VARCHAR(255) PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL,
+        thread_id VARCHAR(255) NOT NULL,
+        state JSONB,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_sessions_user ON agent_sessions(user_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_thread ON agent_sessions(thread_id);
+    `);
+    
+    // Create audit_log table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        auth0_trace_id VARCHAR(255),
+        session_id UUID,
+        user_id VARCHAR(255) NOT NULL,
+        agent_id VARCHAR(100) DEFAULT 'fulcrum:security-auditor',
+        action VARCHAR(100) NOT NULL,
+        resource VARCHAR(255),
+        fga_result VARCHAR(20),
+        ciba_status VARCHAR(20),
+        result VARCHAR(20) NOT NULL,
+        details JSONB,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
+      CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+    `);
+    
+    // Create tool_executions table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tool_executions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        session_id UUID,
+        tool_name VARCHAR(100) NOT NULL,
+        input JSONB,
+        output JSONB,
+        fga_check_passed BOOLEAN,
+        ciba_required BOOLEAN DEFAULT false,
+        ciba_approved BOOLEAN,
+        token_vault_used BOOLEAN DEFAULT true,
+        execution_time_ms INTEGER,
+        cost_estimate DECIMAL(10, 4),
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_tool_session ON tool_executions(session_id);
+      CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_executions(tool_name);
+      CREATE INDEX IF NOT EXISTS idx_tool_created ON tool_executions(created_at);
+    `);
+    
+    logger.info('Database schema initialized (CIBA, sessions, audit tables)');
   } finally {
     client.release();
   }

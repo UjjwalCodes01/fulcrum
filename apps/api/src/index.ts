@@ -13,10 +13,12 @@ import { auditRouter } from './routes/audit.js';
 import { healthRouter } from './routes/health.js';
 import { fgaRouter } from './routes/fga.js';
 import { cibaRouter } from './routes/ciba.js';
+import { metricsRouter } from './routes/metrics.js';
 import { logger } from './utils/logger.js';
 import { errorHandler } from './utils/error-handler.js';
 import { startCIBAPolling } from './pubsub/ciba-handler.js';
 import { initializeDatabase, isDatabaseConfigured } from './db/client.js';
+import { initializeAuditTables } from './utils/audit.js';
 
 const app: Express = express();
 const httpServer = createServer(app);
@@ -47,6 +49,8 @@ const limiter = rateLimit({
 app.use('/api/', limiter);
 
 // Body parsing
+// For webhook signature verification, we need raw body for CIBA webhooks
+app.use('/api/ciba/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -55,6 +59,7 @@ app.set('io', io);
 
 // Routes
 app.use('/api/health', healthRouter);
+app.use('/api/metrics', metricsRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/agent', agentRouter);
 app.use('/api/connections', connectionsRouter);
@@ -72,10 +77,49 @@ io.on('connection', (socket) => {
   socket.on('join-session', (sessionId: string) => {
     socket.join(`session:${sessionId}`);
     logger.info(`Socket ${socket.id} joined session ${sessionId}`);
+    
+    // Register real-time CIBA listener for this session
+    const { registerSessionListener } = require('./pubsub/ciba-handler.js');
+    
+    // Register listener and get cleanup function
+    const cleanup = registerSessionListener(sessionId, (event: any) => {
+      // Emit CIBA status update to this session's room
+      io.to(`session:${sessionId}`).emit('ciba-status-update', {
+        requestId: event.requestId,
+        status: event.status,
+        timestamp: event.timestamp,
+      });
+      
+      logger.debug('CIBA status update pushed to session', {
+        sessionId,
+        requestId: event.requestId,
+        status: event.status,
+      });
+    });
+    
+    // Store cleanup function and sessionId on socket for later use
+    socket.data.cibaCleanup = cleanup;
+    socket.data.sessionId = sessionId;
+    
+    // Clean up listener when socket leaves session
+    socket.on('leave-session', () => {
+      if (socket.data.cibaCleanup) {
+        socket.data.cibaCleanup();
+        socket.data.cibaCleanup = null;
+        socket.data.sessionId = null;
+      }
+      logger.info(`Socket ${socket.id} left session ${sessionId}`);
+    });
   });
 
   socket.on('disconnect', () => {
     logger.info(`Client disconnected: ${socket.id}`);
+    
+    // Clean up CIBA listener on disconnect (handles browser tab close, etc.)
+    if (socket.data.cibaCleanup) {
+      socket.data.cibaCleanup();
+      logger.debug(`CIBA listener cleaned up on disconnect for session ${socket.data.sessionId}`);
+    }
   });
 });
 
@@ -93,6 +137,10 @@ httpServer.listen(PORT, async () => {
     if (dbConfigured) {
       await initializeDatabase();
       logger.info('💾 PostgreSQL database initialized');
+      
+      // Initialize audit tables
+      await initializeAuditTables();
+      logger.info('📊 Audit tables initialized');
     } else {
       logger.warn('⚠️ Database not configured - using in-memory storage (NOT production safe)');
     }

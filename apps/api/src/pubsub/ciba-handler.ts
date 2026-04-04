@@ -96,39 +96,71 @@ class CIBAEventBus extends EventEmitter {
 export const cibaEventBus = CIBAEventBus.getInstance();
 
 // Session listeners for real-time notifications
-// Maps sessionId -> callback function
-const sessionListeners = new Map<string, (event: CIBAEvent) => void>();
+// Maps sessionId -> Set of callback functions (supports multiple tabs)
+const sessionListeners = new Map<string, Set<(event: CIBAEvent) => void>>();
 
 /**
  * Register a session to receive CIBA status updates
+ * Supports multiple listeners per session (multiple browser tabs)
  */
 export function registerSessionListener(
   sessionId: string, 
   callback: (event: CIBAEvent) => void
-): void {
-  sessionListeners.set(sessionId, callback);
-  logger.debug('Session listener registered', { sessionId });
+): () => void {
+  let listeners = sessionListeners.get(sessionId);
+  if (!listeners) {
+    listeners = new Set();
+    sessionListeners.set(sessionId, listeners);
+  }
+  
+  listeners.add(callback);
+  logger.debug('Session listener registered', { 
+    sessionId, 
+    listenerCount: listeners.size 
+  });
+  
+  // Return cleanup function
+  return () => {
+    const currentListeners = sessionListeners.get(sessionId);
+    if (currentListeners) {
+      currentListeners.delete(callback);
+      if (currentListeners.size === 0) {
+        sessionListeners.delete(sessionId);
+        logger.debug('Session listeners cleaned up', { sessionId });
+      } else {
+        logger.debug('Session listener removed', { 
+          sessionId, 
+          remainingCount: currentListeners.size 
+        });
+      }
+    }
+  };
 }
 
 /**
- * Unregister a session from CIBA updates
+ * Unregister all listeners for a session
  */
 export function unregisterSessionListener(sessionId: string): void {
-  sessionListeners.delete(sessionId);
-  logger.debug('Session listener unregistered', { sessionId });
+  const removed = sessionListeners.delete(sessionId);
+  if (removed) {
+    logger.debug('All session listeners removed', { sessionId });
+  }
 }
 
 /**
  * Notify a session of a CIBA status change
+ * Handles multiple listeners per session (multiple browser tabs)
  */
 function notifySession(sessionId: string, event: CIBAEvent): void {
-  const listener = sessionListeners.get(sessionId);
-  if (listener) {
-    try {
-      listener(event);
-    } catch (error) {
-      logger.error('Error notifying session', { sessionId, error });
-    }
+  const listeners = sessionListeners.get(sessionId);
+  if (listeners && listeners.size > 0) {
+    listeners.forEach(listener => {
+      try {
+        listener(event);
+      } catch (error) {
+        logger.error('Error notifying session listener', { sessionId, error });
+      }
+    });
   }
 }
 
@@ -188,9 +220,6 @@ export async function processCIBAStatusUpdate(
  */
 export async function pollPendingRequests(): Promise<number> {
   // Get all pending requests across all users
-  // This is inefficient but works for both storage modes
-  // In production with PostgreSQL, we could optimize with a single query
-  
   const storageInfo = await getStorageModeInfo();
   let allPendingRequests: CIBARequest[] = [];
   
@@ -200,12 +229,44 @@ export async function pollPendingRequests(): Promise<number> {
     allPendingRequests = Array.from(cibaRequests.values())
       .filter((r: CIBARequest) => r.status === 'pending');
   } else {
-    // For PostgreSQL, we need to get all pending requests
-    // This is a hack - in production you'd have a better way to get all pending
-    // For now, we'll rely on expireOldRequests to handle expiration
-    // and users polling their own pending requests
-    // A production system would have a background worker polling the DB
-    allPendingRequests = [];
+    // For PostgreSQL mode, query all pending requests
+    const { getPool } = await import('../db/client.js');
+    
+    try {
+      const pool = getPool();
+      const result = await pool.query(
+        `SELECT * FROM ciba_requests 
+         WHERE status = 'pending' AND expires_at > NOW()
+         ORDER BY created_at ASC`
+      );
+      
+      // Map rows to CIBARequest objects
+      allPendingRequests = result.rows.map((row: any) => ({
+        id: row.id,
+        userId: row.user_id,
+        tool: row.tool,
+        status: row.status,
+        authReqId: row.auth_req_id,
+        sessionId: row.session_id,
+        bindingMessage: row.binding_message,
+        toolInput: row.tool_input,
+        expiresAt: new Date(row.expires_at),
+        approvedAt: row.approved_at ? new Date(row.approved_at) : undefined,
+        deniedAt: row.denied_at ? new Date(row.denied_at) : undefined,
+        createdAt: new Date(row.created_at),
+        updatedAt: new Date(row.updated_at),
+      }));
+      
+      logger.debug('Fetched pending CIBA requests from PostgreSQL', {
+        count: allPendingRequests.length,
+      });
+    } catch (error) {
+      logger.error('Failed to fetch pending CIBA requests from PostgreSQL', {
+        error: (error as Error).message,
+      });
+      // Return empty array on error - don't crash the poller
+      allPendingRequests = [];
+    }
   }
   
   let updated = 0;

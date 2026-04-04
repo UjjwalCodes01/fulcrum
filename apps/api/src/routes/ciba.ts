@@ -7,7 +7,7 @@
 
 import { Router, IRouter, Request, Response, NextFunction } from 'express';
 import { logger } from '../utils/logger.js';
-import { jwtCheck, getUserFromToken } from '../middleware/auth.js';
+import { getUserFromToken, requireAdmin } from '../middleware/auth.js';
 import {
   handleAuth0Webhook,
   getCIBAStats,
@@ -56,7 +56,7 @@ cibaRouter.post('/webhook', async (req: Request, res: Response, next: NextFuncti
     
     // SECURITY: Verify webhook signature in production
     if (strictMode) {
-      const signature = req.headers['x-auth0-signature'] as string;
+      const rawSignature = req.headers['x-auth0-signature'];
       
       if (!webhookSecret) {
         logger.error('CIBA_WEBHOOK_SECRET not configured in strict mode');
@@ -66,26 +66,50 @@ cibaRouter.post('/webhook', async (req: Request, res: Response, next: NextFuncti
         });
       }
       
-      if (!signature) {
-        logger.warn('Missing webhook signature in strict mode');
+      // Validate signature header format
+      if (!rawSignature || typeof rawSignature !== 'string') {
+        logger.warn('Missing or invalid webhook signature header in strict mode', {
+          hasSignature: !!rawSignature,
+          signatureType: typeof rawSignature
+        });
         return res.status(401).json({
-          error: 'Missing webhook signature',
+          error: 'Missing or invalid webhook signature',
           code: 'WEBHOOK_SIGNATURE_MISSING',
         });
       }
       
-      // Verify HMAC signature
-      // Auth0 uses HMAC-SHA256 with the webhook secret
+      const signature = rawSignature.trim();
+      
+      // Verify HMAC signature with production-safe error handling
+      // IMPORTANT: Must use raw body, not JSON.stringify(parsed body)
+      // Express raw middleware captures this in req.body as Buffer
       const crypto = await import('crypto');
+      const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+      
       const expectedSignature = crypto
         .createHmac('sha256', webhookSecret)
-        .update(JSON.stringify(req.body))
+        .update(rawBody)
         .digest('hex');
       
-      const signatureValid = crypto.timingSafeEqual(
-        Buffer.from(signature),
-        Buffer.from(expectedSignature)
-      );
+      // Safe signature comparison that handles malformed input
+      let signatureValid = false;
+      try {
+        // Ensure both signatures are the same length before comparison
+        const receivedBuffer = Buffer.from(signature, 'hex');
+        const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+        
+        if (receivedBuffer.length === expectedBuffer.length) {
+          signatureValid = crypto.timingSafeEqual(receivedBuffer, expectedBuffer);
+        }
+        // If lengths don't match, signatureValid remains false
+      } catch (error) {
+        // Handle cases where signature is not valid hex, wrong encoding, etc.
+        logger.warn('Malformed webhook signature', { 
+          error: error instanceof Error ? error.message : 'Unknown error',
+          signatureLength: signature.length,
+        });
+        signatureValid = false;
+      }
       
       if (!signatureValid) {
         logger.warn('Invalid webhook signature', { 
@@ -100,7 +124,9 @@ cibaRouter.post('/webhook', async (req: Request, res: Response, next: NextFuncti
       logger.info('Webhook signature verified');
     }
     
-    const { auth_req_id, status, token } = req.body;
+    // Parse body if it's still a Buffer (from express.raw)
+    const payload = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
+    const { auth_req_id, status, token } = payload;
     
     if (!auth_req_id || !status) {
       return res.status(400).json({
@@ -132,15 +158,13 @@ cibaRouter.post('/webhook', async (req: Request, res: Response, next: NextFuncti
 /**
  * POST /api/ciba/poll
  * Manually trigger polling for pending CIBA requests
- * Useful for debugging and testing
+ * ADMIN ONLY - Can potentially impact performance
  */
-cibaRouter.post('/poll', jwtCheck, async (req: Request, res: Response, next: NextFunction) => {
+cibaRouter.post('/poll', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = getUserFromToken(req);
     
-    // Only allow admins to manually poll
-    // For hackathon, allow any authenticated user
-    logger.info('Manual CIBA poll triggered', { userId: user?.userId });
+    logger.info('Manual CIBA poll triggered by admin', { userId: user?.userId });
     
     const updated = await pollPendingRequests();
     
@@ -156,10 +180,12 @@ cibaRouter.post('/poll', jwtCheck, async (req: Request, res: Response, next: Nex
 
 /**
  * POST /api/ciba/polling/start
- * Start background polling (admin only)
+ * Start background polling (ADMIN ONLY)
+ * This affects global system behavior
  */
-cibaRouter.post('/polling/start', jwtCheck, async (req: Request, res: Response, next: NextFunction) => {
+cibaRouter.post('/polling/start', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const user = getUserFromToken(req);
     const { intervalMs } = req.body;
     const interval = intervalMs ? parseInt(intervalMs) : 5000;
     
@@ -169,6 +195,11 @@ cibaRouter.post('/polling/start', jwtCheck, async (req: Request, res: Response, 
         code: 'INVALID_INTERVAL',
       });
     }
+    
+    logger.info('CIBA polling started by admin', { 
+      userId: user?.userId, 
+      intervalMs: interval 
+    });
     
     startCIBAPolling(interval);
     
@@ -184,10 +215,15 @@ cibaRouter.post('/polling/start', jwtCheck, async (req: Request, res: Response, 
 
 /**
  * POST /api/ciba/polling/stop
- * Stop background polling (admin only)
+ * Stop background polling (ADMIN ONLY)
+ * This affects global system behavior
  */
-cibaRouter.post('/polling/stop', jwtCheck, async (_req: Request, res: Response, next: NextFunction) => {
+cibaRouter.post('/polling/stop', requireAdmin, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const user = getUserFromToken(req);
+    
+    logger.info('CIBA polling stopped by admin', { userId: user?.userId });
+    
     stopCIBAPolling();
     
     res.json({
